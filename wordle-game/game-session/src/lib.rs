@@ -1,201 +1,151 @@
 #![no_std]
-use gstd::{msg, exec, prelude::*, ActorId, debug, collections::HashMap,msg::send_delayed};
 use game_session_io::*;
+use gstd::{exec, msg, debug};
 
-static mut GAME_SESSION: Option<GameSession> = None;
+const TRIES_LIMIT: u8 = 6; // 每个游戏会话的最大尝试次数
 
+static mut GAME_SESSION_STATE: Option<GameSession> = None;
 
 #[no_mangle]
 extern "C" fn init() {
-    let wordle_program: ActorId = match msg::load() {
-        Ok(actor_id) => actor_id,
-        Err(_) => {
-            debug!("Failed to load ActorId");
-            return;
-        }
-    };
+    let game_session_init: GameSessionInit = msg::load().expect("Failed to decode GameSessionInit");
+    game_session_init.assert_valid();
+
     unsafe {
-        GAME_SESSION = Some(GameSession {
-            wordle_program,
-            games: HashMap::new(),
-        });
+        GAME_SESSION_STATE = Some(game_session_init.into());
     }
 }
 
 #[no_mangle]
 extern "C" fn handle() {
-    let action: Action = match msg::load() {
-        Ok(action) => action,
-        Err(_) => {
-            debug!("Failed to load action");
-            msg::reply("Failed to load action", 0).expect("Failed to send reply");
-            return;
-        }
-    };
+    let game_session_action: GameSessionAction = msg::load().expect("Failed to decode GameSessionAction");
+    let game_session = get_game_session_mut();
+    let user = msg::source();
+    match game_session_action {
+        GameSessionAction::StartGame => {
+            let session_info = game_session.sessions.entry(user).or_default();
+            match session_info.session_status {
+                SessionStatus::Init => {
+                    let send_to_wordle_msg_id = msg::send(
+                        game_session.wordle_program_id,
+                        WordleAction::StartGame { user },
+                        0,
+                    ).expect("Failed to send message to Wordle");
 
-    let game_session = unsafe {
-        GAME_SESSION.as_mut().expect("Game session is not initialized")
-    };
+                    session_info.session_status = SessionStatus::WaitWordleStartReply;
+                    session_info.original_msg_id = msg::id();
+                    session_info.send_to_wordle_msg_id = send_to_wordle_msg_id;
+                    session_info.session_id = msg::id(); // 更新会话 ID
 
-    match action {
-        Action::EndGame { user } => {
-            let game_status = match game_session.games.get_mut(&user) {
-                Some(status) => status,
-                None => {
-                    msg::reply("Game does not exist for the user", 0).expect("Failed to send reply");
-                    return;
+                    msg::send_delayed(
+                        exec::program_id(),
+                        GameSessionAction::CheckGameStatus {
+                            user,
+                            session_id: session_info.session_id,
+                        },
+                        0,
+                        200,
+                    ).expect("Failed to send delayed message");
+                    exec::wait();
                 }
-            };
-            if game_status.status == GameState::InProgress {
-                game_status.status = GameState::GameOver(Outcome::Lose);
-                msg::reply("Game over due to timeout", 0).expect("Failed to send reply");
+                _ => panic!("Invalid state for starting a game"),
             }
         }
-        Action::StartGame { user } => {
-            if game_session.games.contains_key(&user) {
-                msg::reply("Game already exists for the user", 0).expect("Failed to send reply");
-                return;
-            }
+        GameSessionAction::CheckWord { word } => {
+            let session_info = game_session.sessions.entry(user).or_default();
+            debug!("check{:?}", session_info);
+            match session_info.session_status {
+                SessionStatus::ReplyReceived(_) | SessionStatus::WaitUserInput => {
+                    assert!(
+                        word.len() == 5 && word.chars().all(|c| c.is_lowercase()),
+                        "Invalid word"
+                    );
 
-            let start_game_msg = Action::StartGame { user };
-            msg::send(game_session.wordle_program, start_game_msg.encode(), 0)
-                .expect("Failed to send StartGame message");
+                    let send_to_wordle_msg_id = msg::send(
+                        game_session.wordle_program_id,
+                        WordleAction::CheckWord { user, word },
+                        0,
+                    ).expect("Failed to send message to Wordle");
 
-            game_session.games.insert(user, GameStatus {
-                word: None,
-                attempts: 0,
-                status: GameState::InProgress,
-            });
+                    session_info.original_msg_id = msg::id();
+                    session_info.send_to_wordle_msg_id = send_to_wordle_msg_id;
+                    session_info.session_status = SessionStatus::WaitWordleCheckWordReply;
 
-            // 添加延迟消息
-            exec::send_delayed(
-                exec::program_id(),
-                Action::EndGame { user }.encode(),
-                200,
-            ).expect("Failed to send delayed message");
-
-            msg::reply("Game successfully started", 0).expect("Failed to send reply");
-            exec::wait();
-        }
-        Action::CheckWord { user, word } => {
-            let game_status = match game_session.games.get_mut(&user) {
-                Some(status) => status,
-                None => {
-                    msg::reply("Game does not exist for the user", 0).expect("Failed to send reply");
-                    return;
+                    // Increment tries
+                    session_info.tries += 1;
+                    exec::wait();
                 }
-            };
-
-            if game_status.status != GameState::InProgress {
-                msg::reply("Game is not in progress", 0).expect("Failed to send reply");
-                return;
+                _ => panic!("Invalid state for checking a word"),
             }
-
-            if word.len() != 5 || !word.chars().all(char::is_lowercase) {
-                msg::reply("Invalid word format", 0).expect("Failed to send reply");
-                return;
-            }
-
-            let check_word_msg = Action::CheckWord { user, word: word.clone() };
-            msg::send(game_session.wordle_program, check_word_msg.encode(), 0)
-                .expect("Failed to send CheckWord message");
-            game_status.attempts += 1;
-            msg::reply("Word checked successfully", 0).expect("Failed to send reply");
-            exec::wait();
         }
-        Action::CheckGameStatus { user } => {
-            let game_status = match game_session.games.get(&user) {
-                Some(status) => status,
-                None => {
-                    msg::reply("Game does not exist for the user", 0).expect("Failed to send reply");
-                    return;
+        GameSessionAction::CheckGameStatus { user, session_id } => {
+            if msg::source() == exec::program_id() {
+                if let Some(session_info) = game_session.sessions.get_mut(&user) {
+                    if session_id == session_info.session_id
+                        && !matches!(session_info.session_status, SessionStatus::GameOver(..))
+                    {
+                        session_info.session_status = SessionStatus::GameOver(GameStatus::Lose);
+                        msg::send(user, GameSessionEvent::GameOver(GameStatus::Lose), 0)
+                            .expect("Failed to send GameOver message");
+                    }
                 }
-            };
-
-            let status_message = match game_status.status {
-                GameState::NotStarted => "Game not started",
-                GameState::InProgress => "Game is in progress",
-                GameState::GameOver(Outcome::Win) => "Game over: Win",
-                GameState::GameOver(Outcome::Lose) => "Game over: Lose",
-            };
-
-            msg::reply(status_message, 0).expect("Failed to send reply");
+            }
         }
     }
 }
 
 #[no_mangle]
 extern "C" fn handle_reply() {
-    let reply: Event = match msg::load() {
-        Ok(reply) => reply,
-        Err(_) => {
-            debug!("Failed to load event");
-            msg::reply("Failed to load event", 0).expect("Failed to send reply");
-            return;
-        }
-    };
+    let reply_to = msg::reply_to().expect("Failed to retrieve reply_to message");
+    let wordle_event: WordleEvent = msg::load().expect("Failed to decode WordleEvent");
+    let game_session = get_game_session_mut();
+    let user = wordle_event.get_user();
 
-    let game_session = unsafe {
-        GAME_SESSION.as_mut().expect("Game session is not initialized")
-    };
+    if let Some(session_info) = game_session.sessions.get_mut(user) {
+        if reply_to == session_info.send_to_wordle_msg_id && session_info.is_wait_reply_status() {
+            assert!(matches!(
+                session_info.session_status,
+                SessionStatus::WaitWordleStartReply | SessionStatus::WaitWordleCheckWordReply
+            ), "Unexpected session status");
 
-    match reply {
-        Event::GameStarted { user } => {
-            let game_status = match game_session.games.get_mut(&user) {
-                Some(status) => status,
-                None => {
-                    msg::reply("Game does not exist for the user", 0).expect("Failed to send reply");
-                    return;
-                }
-            };
-            game_status.status = GameState::InProgress;
-            debug!("Game started for user: {:?}", user);
-        }
-        Event::WordChecked { user, correct_positions, contained_in_word } => {
-            let game_status = match game_session.games.get_mut(&user) {
-                Some(status) => status,
-                None => {
-                    msg::reply("Game does not exist for the user", 0).expect("Failed to send reply");
-                    return;
-                }
-            };
+            // 更新状态为 ReplyReceived
+            session_info.session_status = SessionStatus::ReplyReceived(wordle_event.clone());
 
-            if correct_positions.len() == 5 {
-                game_status.status = GameState::GameOver(Outcome::Win);
-                debug!("User {:?} has guessed the word correctly!", user);
-            } else if game_status.attempts >= 6 {
-                game_status.status = GameState::GameOver(Outcome::Lose);
-                debug!("User {:?} has used all attempts and failed to guess the word.", user);
+            // 检查游戏是否胜利
+            if wordle_event.has_guessed() {
+                session_info.session_status = SessionStatus::GameOver(GameStatus::Win);
+            }
+            // 检查是否达到尝试次数限制
+            else if session_info.tries >= TRIES_LIMIT {
+                session_info.session_status = SessionStatus::GameOver(GameStatus::Lose);
+            }
+            // 否则继续等待用户输入
+            else {
+                session_info.session_status = SessionStatus::WaitUserInput;
             }
 
-            debug!(
-                "Word checked for user: {:?}, correct_positions: {:?}, contained_in_word: {:?}",
-                user, correct_positions, contained_in_word
-            );
+            // 唤醒等待中的消息
+            exec::wake(reply_to).expect("Failed to wake up previous message");
+        } else {
+            panic!("Unexpected reply or session status does not match waiting state");
         }
+    } else {
+        panic!("Session info not found for user");
     }
-
-    msg::reply("Reply handled successfully", 0).expect("Failed to send reply");
 }
+
 
 #[no_mangle]
 extern "C" fn state() {
-    let game_session = unsafe {
-        GAME_SESSION.as_ref().expect("Game session is not initialized")
-    };
-    let state_info = game_session.games.iter().map(|(user, status)| {
-        (
-            user,
-            match status.status {
-                GameState::NotStarted => "NotStarted",
-                GameState::InProgress => "InProgress",
-                GameState::GameOver(Outcome::Win) => "GameOver(Win)",
-                GameState::GameOver(Outcome::Lose) => "GameOver(Lose)",
-            },
-            status.attempts,
-            status.word.as_deref().unwrap_or(""),
-        )
-    }).collect::<Vec<_>>();
+    let game_session = get_game_session();
+    let state: GameSessionState = game_session.into();
+    msg::reply(state, 0).expect("Failed to send state reply");
+}
 
-    msg::reply(state_info, 0).expect("Failed to share state");
+fn get_game_session() -> &'static GameSession {
+    unsafe { GAME_SESSION_STATE.as_ref().expect("Game session is not initialized") }
+}
+
+fn get_game_session_mut() -> &'static mut GameSession {
+    unsafe { GAME_SESSION_STATE.as_mut().expect("Game session is not initialized") }
 }
