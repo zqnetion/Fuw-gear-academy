@@ -8,6 +8,7 @@ mod tests {
     const GAME_SESSION_ID: u64 = 2;
     const USER1: u64 = 10;
 
+    
     fn setup() -> System {
         let sys = System::new();
         sys.init_logger();
@@ -23,7 +24,6 @@ mod tests {
         // 初始化wordle和game_session程序
         assert!(!wordle.send(user_id, wordle_id).main_failed());
         assert!(!game_session.send(user_id, wordle_id).main_failed());
-
         sys
     }
 
